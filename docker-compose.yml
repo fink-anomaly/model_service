@@ -3,7 +3,7 @@ version: '3.4'
 
 services:
   app:
-    build: ./srd/app
+    build: ./src/app
     volumes:
       - ./data:/data
     ports:
