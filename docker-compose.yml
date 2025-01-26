@@ -1,0 +1,34 @@
+
+version: '3.4'
+
+services:
+  app:
+    build: ./app
+    volumes:
+      - ./data:/data
+    ports:
+      - "8082:8082"
+    depends_on:
+      - minio
+    environment:
+      MINIO_URL: ${MINIO_URL}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      BUCKET_NAME: ${BUCKET_NAME}
+      BUCKET_DATASETS_NAME: ${BUCKET_DATASETS_NAME}
+  minio:
+    image: quay.io/minio/minio:RELEASE.2023-11-01T01-57-10Z-cpuv1
+    command: server --console-address ":9001" /data
+    env_file:
+      - .env
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+
+volumes:
+  minio_data:
