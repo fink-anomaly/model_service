@@ -32,6 +32,7 @@ import requests
 import json
 from concurrent.futures import ProcessPoolExecutor
 from pydantic import BaseModel
+from coniferest.label import Label
 
 executor = ProcessPoolExecutor(max_workers=2)
 
@@ -285,24 +286,22 @@ def get_reactions(positive: List[str], negative: List[str]):
     pdf = pdf.loc[(pdf['d:lc_features_g'].astype(str) != '[]') & (pdf['d:lc_features_r'].astype(str) != '[]')]
     feature_columns = ['d:lc_features_g', 'd:lc_features_r']
     common_rems = [
-        'percent_amplitude',
-        'linear_fit_reduced_chi2',
-        'inter_percentile_range_10',
-        'mean_variance',
-        'linear_trend',
-        'standard_deviation',
-        'weighted_mean',
-        'mean'
+        # 'percent_amplitude',
+        # 'linear_fit_reduced_chi2',
+        # 'inter_percentile_range_10',
+        # 'mean_variance',
+        # 'linear_trend',
+        # 'standard_deviation',
+        # 'weighted_mean',
+        # 'mean'
     ]
     result = dict()
     for section in feature_columns:
         pdf[feature_names] = pdf[section].to_list()
         pdf_gf = pdf.drop(feature_columns, axis=1).rename(columns={'i:objectId': 'object_id'})
-        classes = np.where(pdf_gf['object_id'].isin(good_reactions), True, False)
-        
         pdf_gf = pdf_gf.reindex(sorted(pdf_gf.columns), axis=1)
         pdf_gf.drop(common_rems, axis=1, inplace=True)
-        pdf_gf['class'] = classes
+        pdf_gf['class'] = pdf_gf['class'].apply(lambda x: Label.A if x in good_reactions else Label.R)
         pdf_gf.dropna(inplace=True)
         pdf_gf.drop_duplicates(subset=['object_id'], inplace=True)
         pdf_gf.drop(['object_id'], axis=1, inplace=True)
@@ -360,14 +359,14 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     assert data['_r'].shape[1] == data['_g'].shape[1], '''Mismatch of the dimensions of r/g!'''
     classes = {filter_ : data[filter_]['class'] for filter_ in filter_base}
     common_rems = [
-        'percent_amplitude',
-        'linear_fit_reduced_chi2',
-        'inter_percentile_range_10',
-        'mean_variance',
-        'linear_trend',
-        'standard_deviation',
-        'weighted_mean',
-        'mean'
+        # 'percent_amplitude',
+        # 'linear_fit_reduced_chi2',
+        # 'inter_percentile_range_10',
+        # 'mean_variance',
+        # 'linear_trend',
+        # 'standard_deviation',
+        # 'weighted_mean',
+        # 'mean'
     ]
     data = {key : item.drop(labels=['object_id', 'class'] + common_rems,
                 axis=1) for key, item in data.items()}
@@ -376,25 +375,22 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     print('Training...')
     result_models_IO = []
     for key in filter_base:
-        is_unknown = classes[key] == 'Unknown'
         initial_type = [('X', FloatTensorType([None, data[key].shape[1]]))]
-        search_params_aad = {
-            "n_trees": (100, 150, 200, 300, 500, 700, 1024),
-            "n_subsamples": (int(obj*data[key].shape[0]) for obj in (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)),
-            "tau": (1 - sum(is_unknown) / len(data[key]), ),
-            "n_jobs": (12,)
-        }
-        forest_simp = train_base_AAD(
-            data[key],
-            search_params_aad,
-            scorer_AAD,
-            is_unknown,
-            use_default_model=True
-        )
         reactions_dataset = reactions_datasets[key]
         reactions = reactions_dataset['class'].values
         reactions_dataset.drop(['class'], inplace=True, axis=1)
-        forest_simp.fit(np.array(reactions_dataset), reactions)
+        forest_simp = AADForest(
+            n_trees=150,
+            n_subsamples=int(0.5*len(data[key])),
+            tau=0.97,
+            C_a=1.0,
+            n_jobs=1,
+            random_seed=42
+        ).fit_known(
+            data[key].values,
+            known_data=reactions_dataset.values,
+            known_labels=reactions
+        )
         onx = to_onnx_add(forest_simp, initial_types=initial_type)
         result_models_IO.append(onx.SerializeToString())
 
