@@ -266,7 +266,7 @@ def get_reactions(positive: List[str], negative: List[str]):
     oids = list(good_reactions.union(bad_reactions))
     # r = await fetch_data(oids)
     r = requests.post(
-        'https://fink-portal.org/api/v1/objects',
+        'https://api.fink-portal.org/api/v1/objects',
         json={
             'objectId': ','.join(oids),
             'columns': 'd:lc_features_g,d:lc_features_r,i:objectId',
