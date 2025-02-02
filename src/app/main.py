@@ -301,7 +301,7 @@ def get_reactions(positive: List[str], negative: List[str]):
         pdf_gf = pdf.drop(feature_columns, axis=1).rename(columns={'i:objectId': 'object_id'})
         pdf_gf = pdf_gf.reindex(sorted(pdf_gf.columns), axis=1)
         pdf_gf.drop(common_rems, axis=1, inplace=True)
-        pdf_gf['class'] = pdf_gf['class'].apply(lambda x: Label.A if x in good_reactions else Label.R)
+        pdf_gf['class'] = pdf_gf['object_id'].apply(lambda x: Label.A if x in good_reactions else Label.R)
         pdf_gf.dropna(inplace=True)
         pdf_gf.drop_duplicates(subset=['object_id'], inplace=True)
         pdf_gf.drop(['object_id'], axis=1, inplace=True)
@@ -387,9 +387,9 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
             n_jobs=1,
             random_seed=42
         ).fit_known(
-            data[key].values,
-            known_data=reactions_dataset.values,
-            known_labels=reactions
+            data[key].values.copy(order='C'),
+            known_data=reactions_dataset.values.copy(order='C'),
+            known_labels=reactions.copy(order='C')
         )
         onx = to_onnx_add(forest_simp, initial_types=initial_type)
         result_models_IO.append(onx.SerializeToString())
@@ -401,9 +401,9 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     zip_buffer.seek(0)
     try:
         minio_client.put_object(
-            BUCKET_NAME, 
-            f"anomaly_detection_forest_AAD_{name}.zip", 
-            zip_buffer, 
+            BUCKET_NAME,
+            f"anomaly_detection_forest_AAD_{name}.zip",
+            zip_buffer,
             length=zip_buffer.getbuffer().nbytes,
             content_type='application/zip'
         )
@@ -425,7 +425,7 @@ def list_models():
 def retrain_model(
     data: ModelData, background_tasks: BackgroundTasks
 ):
-    
+
     db = SessionLocal()
     model = db.query(Model).filter(Model.name == data.model_name).first()
     if not model:
@@ -460,7 +460,7 @@ def get_last_update_model(model_name: str):
     model = db.query(Model).filter(Model.name == model_name).first()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    
+
     last_update = model.last_update.isoformat() if model.last_update else None
     return {"last_update_time": last_update,
             "num_reactions": model.num_reactions}
@@ -471,7 +471,7 @@ def get_last_download_model(model_name: str):
     model = db.query(Model).filter(Model.name == model_name).first()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    
+
     last_download = model.last_download.isoformat() if model.last_download else None
     return {"last_download_time": last_download,
             "num_reactions": model.num_reactions}
