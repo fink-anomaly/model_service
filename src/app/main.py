@@ -75,6 +75,7 @@ class Model(Base):
     last_download = Column(DateTime, nullable=True)
     last_request_update = Column(DateTime, nullable=False, default=datetime.utcnow())
     num_reactions = Column(Integer, nullable=False, default=0)
+    status = Column(Integer, nullable=False, default=0)
 
 Base.metadata.create_all(bind=engine)
 
@@ -269,7 +270,7 @@ def get_reactions(positive: List[str], negative: List[str]):
     r = requests.post(
         'https://api.fink-portal.org/api/v1/objects',
         json={
-            'objectId': ','.join(oids),
+            'objectId': ','.join([obj for obj in oids if 'ZTF' in oids]),
             'columns': 'd:lc_features_g,d:lc_features_r,i:objectId',
             'output-format': 'json'
         }
@@ -310,6 +311,10 @@ def get_reactions(positive: List[str], negative: List[str]):
 
 def retrain_task(name: str, positive: List[str], negative: List[str]):
     reactions_datasets = get_reactions(positive, negative)
+    db = SessionLocal()
+    model = db.query(Model).filter(Model.name == data.model_name).first()
+    model.status = 2
+    db.commit()
     filter_base = ('_r', '_g')
     response = minio_client.get_object(BUCKET_DATASETS_NAME, "base_dataset.parquet")
     dataset = BytesIO(response.read())
@@ -344,7 +349,8 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
                         continue
                     new_data[col[:-2]].append(r_data)
             pbar.update()
-
+    model.status = 3
+    db.commit()
     main_data = {}
     for passband in datasets:
         new_data = datasets[passband]
@@ -374,6 +380,8 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
         item.mean().to_csv(f'{key}_means.csv')
     print('Training...')
     result_models_IO = []
+    model.status = 4
+    db.commit()
     for key in filter_base:
         initial_type = [('X', FloatTensorType([None, data[key].shape[1]]))]
         reactions_dataset = reactions_datasets[key]
@@ -413,6 +421,7 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
         model.last_update = datetime.utcnow()
     except Exception as e:
         print(f"Failed to upload model {name} to MinIO: {e}")
+    model.status = 0
     db.commit()
     db.close()
 
@@ -430,6 +439,7 @@ def retrain_model(
     model = db.query(Model).filter(Model.name == data.model_name).first()
     if not model:
         model = Model(name=data.model_name, last_update=datetime.utcnow(), last_download=None)
+        model.status = 1
         db.add(model)
         db.commit()
     else:
@@ -438,6 +448,7 @@ def retrain_model(
         if (cur_time-prev_time).total_seconds()/60 < 10:
             return {"status": "You recently requested a model update. Try again later."}
         model.num_reactions = len(data.negative) + len(data.positive)
+        model.status = 1
         db.commit()
         db.close()
     print(dict(data))
@@ -453,6 +464,16 @@ def get_model_signal(model_name: str):
     db.commit()
     db.close()
     return {'status': 'Ok!'}
+
+@app.get("/get_training_status")
+def get_training_status(model_name: str):
+    db = SessionLocal()
+    model = db.query(Model).filter(Model.name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    training_status = model.status
+    return {"training_status": training_status}
 
 @app.get("/get_last_update_model")
 def get_last_update_model(model_name: str):
@@ -483,6 +504,31 @@ def get_count_reactions(model_name: str):
     if not model:
         return {'count_of_reactions': 0}
     return {'count_of_reactions': model.num_reactions}
+
+@app.get("/download_model")
+def download_model(model_name: str, prod: bool):
+    db = SessionLocal()
+    model = db.query(Model).filter(Model.name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if prod:
+        model.last_download = datetime.utcnow()
+        db.commit()
+
+    db.close()
+    object_name = f"anomaly_detection_forest_AAD_{model_name}.zip"
+
+    try:
+        response = minio_client.get_object(BUCKET_NAME, object_name)
+        return Response(
+            content=response.read(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename={object_name}"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Model file not found in MinIO: {e}")
 
 
 if __name__ == '__main__':
