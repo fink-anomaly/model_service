@@ -310,7 +310,10 @@ def get_reactions(positive: List[str], negative: List[str]):
     return result
 
 def retrain_task(name: str, positive: List[str], negative: List[str]):
-    reactions_datasets = get_reactions(positive, negative)
+    if len(positive) + len(negative) != 0:
+        reactions_datasets = get_reactions(positive, negative)
+    else:
+        reactions_dataset = pd.DataFrame()
     db = SessionLocal()
     model = db.query(Model).filter(Model.name == name).first()
     model.status = 2
