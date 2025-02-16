@@ -312,14 +312,13 @@ def get_reactions(positive: List[str], negative: List[str]):
 def retrain_task(name: str, positive: List[str], negative: List[str]):
     reactions_datasets = get_reactions(positive, negative)
     db = SessionLocal()
-    model = db.query(Model).filter(Model.name == data.model_name).first()
+    model = db.query(Model).filter(Model.name == name).first()
     model.status = 2
     db.commit()
     filter_base = ('_r', '_g')
     response = minio_client.get_object(BUCKET_DATASETS_NAME, "base_dataset.parquet")
     dataset = BytesIO(response.read())
     x_buf_data = pd.read_parquet(dataset)
-    print('Датасет получен, стартуем предобработку')
     if "lc_features_r" not in x_buf_data.columns:
         features_1 = x_buf_data["lc_features"].apply(lambda data:
             extract_one(data, "1")).add_suffix("_r")
@@ -422,6 +421,7 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     except Exception as e:
         print(f"Failed to upload model {name} to MinIO: {e}")
     model.status = 0
+    model.last_update = datetime.utcnow()
     db.commit()
     db.close()
 
