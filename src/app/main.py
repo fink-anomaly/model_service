@@ -44,7 +44,7 @@ class ModelData(BaseModel):
 app = FastAPI()
 Base = declarative_base()
 DATABASE_URL = "sqlite:////data/models.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, pool_size=200, max_overflow=100)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 MINIO_URL = os.getenv('MINIO_URL')
@@ -270,14 +270,17 @@ def get_reactions(positive: List[str], negative: List[str]):
     r = requests.post(
         'https://api.fink-portal.org/api/v1/objects',
         json={
-            'objectId': ','.join([obj for obj in oids if 'ZTF' in oids]),
+            'objectId': ','.join([obj for obj in oids if 'ZTF' in obj]),
             'columns': 'd:lc_features_g,d:lc_features_r,i:objectId',
             'output-format': 'json'
         }
     )
     if r.status_code != 200:
+        print(oids)
+        print(','.join([obj for obj in oids if 'ZTF' in obj]))
         print(r.text)
-        return
+        filter_base = ('_r', '_g')
+        return {key: pd.DataFrame() for key in filter_base}
     else:
         print('Fink API: OK')
     pdf = pd.read_json(io.BytesIO(r.content))
@@ -286,16 +289,7 @@ def get_reactions(positive: List[str], negative: List[str]):
     feature_names = FEATURES_COLS
     pdf = pdf.loc[(pdf['d:lc_features_g'].astype(str) != '[]') & (pdf['d:lc_features_r'].astype(str) != '[]')]
     feature_columns = ['d:lc_features_g', 'd:lc_features_r']
-    common_rems = [
-        # 'percent_amplitude',
-        # 'linear_fit_reduced_chi2',
-        # 'inter_percentile_range_10',
-        # 'mean_variance',
-        # 'linear_trend',
-        # 'standard_deviation',
-        # 'weighted_mean',
-        # 'mean'
-    ]
+    common_rems = []
     result = dict()
     for section in feature_columns:
         pdf[feature_names] = pdf[section].to_list()
@@ -310,15 +304,15 @@ def get_reactions(positive: List[str], negative: List[str]):
     return result
 
 def retrain_task(name: str, positive: List[str], negative: List[str]):
+    filter_base = ('_r', '_g')
     if len(positive) + len(negative) != 0:
         reactions_datasets = get_reactions(positive, negative)
     else:
-        reactions_dataset = pd.DataFrame()
+        reactions_datasets = {key: pd.DataFrame() for key in filter_base}
     db = SessionLocal()
     model = db.query(Model).filter(Model.name == name).first()
     model.status = 2
     db.commit()
-    filter_base = ('_r', '_g')
     response = minio_client.get_object(BUCKET_DATASETS_NAME, "base_dataset.parquet")
     dataset = BytesIO(response.read())
     x_buf_data = pd.read_parquet(dataset)
@@ -384,23 +378,38 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     result_models_IO = []
     model.status = 4
     db.commit()
+    reactions_count = min([data.shape[0] for data in reactions_datasets.values()])
     for key in filter_base:
         initial_type = [('X', FloatTensorType([None, data[key].shape[1]]))]
         reactions_dataset = reactions_datasets[key]
-        reactions = reactions_dataset['class'].values
-        reactions_dataset.drop(['class'], inplace=True, axis=1)
-        forest_simp = AADForest(
-            n_trees=150,
-            n_subsamples=int(0.5*len(data[key])),
-            tau=0.97,
-            C_a=1.0,
-            n_jobs=1,
-            random_seed=42
-        ).fit_known(
-            data[key].values.copy(order='C'),
-            known_data=reactions_dataset.values.copy(order='C'),
-            known_labels=reactions.copy(order='C')
-        )
+        
+        if reactions_count > 0:
+            reactions_count = max(reactions_count, reactions_dataset.shape[0])
+            reactions = reactions_dataset['class'].values
+            reactions_dataset.drop(['class'], inplace=True, axis=1)
+            forest_simp = AADForest(
+                n_trees=150,
+                n_subsamples=int(0.5*len(data[key])),
+                tau=0.97,
+                C_a=1.0,
+                n_jobs=1,
+                random_seed=42
+            ).fit_known(
+                data[key].values.copy(order='C'),
+                known_data=reactions_dataset.values.copy(order='C'),
+                known_labels=reactions.copy(order='C')
+            )
+        else:
+            forest_simp = AADForest(
+                n_trees=150,
+                n_subsamples=int(0.5*len(data[key])),
+                tau=0.97,
+                C_a=1.0,
+                n_jobs=1,
+                random_seed=42
+            ).fit(
+                data[key].values.copy(order='C')
+            )
         onx = to_onnx_add(forest_simp, initial_types=initial_type)
         result_models_IO.append(onx.SerializeToString())
 
@@ -424,6 +433,7 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     except Exception as e:
         print(f"Failed to upload model {name} to MinIO: {e}")
     model.status = 0
+    model.num_reactions = reactions_count
     model.last_update = datetime.utcnow()
     db.commit()
     db.close()
@@ -450,7 +460,6 @@ def retrain_model(
         cur_time = datetime.utcnow()
         if (cur_time-prev_time).total_seconds()/60 < 10:
             return {"status": "You recently requested a model update. Try again later."}
-        model.num_reactions = len(data.negative) + len(data.positive)
         model.status = 1
         db.commit()
         db.close()
