@@ -52,6 +52,7 @@ MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY')
 MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY')
 BUCKET_NAME = os.getenv('BUCKET_NAME')
 BUCKET_DATASETS_NAME = os.getenv('BUCKET_DATASETS_NAME')
+BACKGROUND_TRAINING = os.getenv('BACKGROUND_TRAINING')
 
 minio_client = Minio(
     MINIO_URL,
@@ -382,7 +383,7 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     for key in filter_base:
         initial_type = [('X', FloatTensorType([None, data[key].shape[1]]))]
         reactions_dataset = reactions_datasets[key]
-        
+
         if reactions_count > 0:
             reactions_count = max(reactions_count, reactions_dataset.shape[0])
             reactions = reactions_dataset['class'].values
@@ -464,7 +465,10 @@ def retrain_model(
         db.commit()
         db.close()
     print(dict(data))
-    background_tasks.add_task(executor.submit, retrain_task, data.model_name, data.positive, data.negative)
+    if BACKGROUND_TRAINING:
+        background_tasks.add_task(executor.submit, retrain_task, data.model_name, data.positive, data.negative)
+    else:
+        retrain_task(data.model_name, data.positive, data.negative)
     return {"status": "Model retraining started."}
 
 
