@@ -16,7 +16,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       BUCKET_NAME: ${BUCKET_NAME}
       BUCKET_DATASETS_NAME: ${BUCKET_DATASETS_NAME}
-      BACKGROUND_TRAINING: ${BACKGROUND_TRAINING}
+      MAIN_SERVICE_URL: ${MAIN_SERVICE_URL}
   minio:
     image: quay.io/minio/minio:RELEASE.2023-11-01T01-57-10Z-cpuv1
     command: server --console-address ":9001" /data

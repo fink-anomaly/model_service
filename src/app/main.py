@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
+from fastapi_utils.tasks import repeat_every
 from typing import List, Optional
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
@@ -8,6 +9,7 @@ import os
 from minio import Minio
 import pandas as pd
 import io
+from contextlib import asynccontextmanager
 from io import BytesIO
 import os.path
 from collections import defaultdict
@@ -24,6 +26,7 @@ from skl2onnx.common.data_types import FloatTensorType
 from coniferest.onnx import to_onnx as to_onnx_add
 from coniferest.aadforest import AADForest
 from sklearn.model_selection import train_test_split
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import itertools
 import zipfile
 from fink_science.ad_features.processor import FEATURES_COLS
@@ -34,14 +37,44 @@ from concurrent.futures import ProcessPoolExecutor
 from pydantic import BaseModel
 from coniferest.label import Label
 
-executor = ProcessPoolExecutor(max_workers=2)
+executor = ProcessPoolExecutor(max_workers=1)
 
 class ModelData(BaseModel):
     model_name: str
     positive: List[str]
     negative: List[str]
 
-app = FastAPI()
+def daily_retrain():
+    resp = requests.get(f"{os.getenv('MAIN_SERVICE_URL')}/all_users_reactions")
+    print(resp)
+    payload = resp.json()
+    db = SessionLocal()
+    try:
+        for user_data in payload:
+            model_name = user_data["model_name"]
+            positive = user_data["positive"]
+            negative = user_data["negative"]
+            model = db.query(Model).filter(Model.name == model_name).first()
+            if not model:
+                model = Model(name=model_name, last_update=datetime.utcnow(), last_download=None, status=1)
+                db.add(model)
+                db.commit()
+            else:
+                model.status = 1
+                db.commit()
+            executor.submit(retrain_task, model_name, positive, negative)
+    finally:
+        db.close()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(daily_retrain, 'interval', seconds=3600)
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(lifespan=lifespan)
 Base = declarative_base()
 DATABASE_URL = "sqlite:////data/models.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, pool_size=200, max_overflow=100)
@@ -52,7 +85,8 @@ MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY')
 MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY')
 BUCKET_NAME = os.getenv('BUCKET_NAME')
 BUCKET_DATASETS_NAME = os.getenv('BUCKET_DATASETS_NAME')
-BACKGROUND_TRAINING = os.getenv('BACKGROUND_TRAINING')
+SERVICE_VERSION = 0.1
+FILTER_BASE = ('_r', '_g')
 
 minio_client = Minio(
     MINIO_URL,
@@ -280,11 +314,13 @@ def get_reactions(positive: List[str], negative: List[str]):
         print(oids)
         print(','.join([obj for obj in oids if 'ZTF' in obj]))
         print(r.text)
-        filter_base = ('_r', '_g')
-        return {key: pd.DataFrame() for key in filter_base}
+        return {key: pd.DataFrame() for key in FILTER_BASE}
     else:
         print('Fink API: OK')
     pdf = pd.read_json(io.BytesIO(r.content))
+    if pdf.empty:
+        print(f'Вообще никакие фичи не были найдены в базе финка для: {positive}, {negative}')
+        return {key: pd.DataFrame() for key in FILTER_BASE}
     for col in ['d:lc_features_g', 'd:lc_features_r']:
         pdf[col] = pdf[col].apply(lambda x: json.loads(x))
     feature_names = FEATURES_COLS
@@ -305,11 +341,10 @@ def get_reactions(positive: List[str], negative: List[str]):
     return result
 
 def retrain_task(name: str, positive: List[str], negative: List[str]):
-    filter_base = ('_r', '_g')
     if len(positive) + len(negative) != 0:
         reactions_datasets = get_reactions(positive, negative)
     else:
-        reactions_datasets = {key: pd.DataFrame() for key in filter_base}
+        reactions_datasets = {key: pd.DataFrame() for key in FILTER_BASE}
     db = SessionLocal()
     model = db.query(Model).filter(Model.name == name).first()
     model.status = 2
@@ -337,7 +372,7 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     datasets = defaultdict(lambda: defaultdict(list))
     with tqdm(total=len(data)) as pbar:
         for _, row in data.iterrows():
-            for passband in filter_base:
+            for passband in FILTER_BASE:
                 new_data = datasets[passband]
                 new_data['object_id'].append(row.objectId)
                 new_data['class'].append(row['class'])
@@ -358,18 +393,18 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
                 continue
             new_df[col] = new_df[col].astype('float64')
         main_data[passband] = new_df
-    data = {key : main_data[key] for key in filter_base}
+    data = {key : main_data[key] for key in FILTER_BASE}
     assert data['_r'].shape[1] == data['_g'].shape[1], '''Mismatch of the dimensions of r/g!'''
-    classes = {filter_ : data[filter_]['class'] for filter_ in filter_base}
+    classes = {filter_ : data[filter_]['class'] for filter_ in FILTER_BASE}
     common_rems = [
-        # 'percent_amplitude',
-        # 'linear_fit_reduced_chi2',
-        # 'inter_percentile_range_10',
-        # 'mean_variance',
-        # 'linear_trend',
-        # 'standard_deviation',
-        # 'weighted_mean',
-        # 'mean'
+        'percent_amplitude',
+        'linear_fit_reduced_chi2',
+        'inter_percentile_range_10',
+        'mean_variance',
+        'linear_trend',
+        'standard_deviation',
+        'weighted_mean',
+        'mean'
     ]
     data = {key : item.drop(labels=['object_id', 'class'] + common_rems,
                 axis=1) for key, item in data.items()}
@@ -380,7 +415,7 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
     model.status = 4
     db.commit()
     reactions_count = min([data.shape[0] for data in reactions_datasets.values()])
-    for key in filter_base:
+    for key in FILTER_BASE:
         initial_type = [('X', FloatTensorType([None, data[key].shape[1]]))]
         reactions_dataset = reactions_datasets[key]
 
@@ -416,8 +451,8 @@ def retrain_task(name: str, positive: List[str], negative: List[str]):
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr(f'forest{filter_base[0]}_AAD_{name}.onnx', result_models_IO[0])
-        zip_file.writestr(f'forest{filter_base[1]}_AAD_{name}.onnx', result_models_IO[1])
+        zip_file.writestr(f'forest{FILTER_BASE[0]}_AAD_{name}.onnx', result_models_IO[0])
+        zip_file.writestr(f'forest{FILTER_BASE[1]}_AAD_{name}.onnx', result_models_IO[1])
     zip_buffer.seek(0)
     try:
         minio_client.put_object(
@@ -448,7 +483,7 @@ def list_models():
 def retrain_model(
     data: ModelData, background_tasks: BackgroundTasks
 ):
-
+    return {'status': 'Your model is scheduled to be trained via cron. The new training is launched once a day.'}
     db = SessionLocal()
     model = db.query(Model).filter(Model.name == data.model_name).first()
     if not model:
@@ -465,10 +500,7 @@ def retrain_model(
         db.commit()
         db.close()
     print(dict(data))
-    if BACKGROUND_TRAINING:
-        background_tasks.add_task(executor.submit, retrain_task, data.model_name, data.positive, data.negative)
-    else:
-        retrain_task(data.model_name, data.positive, data.negative)
+    background_tasks.add_task(executor.submit, retrain_task, data.model_name, data.positive, data.negative)
     return {"status": "Model retraining started."}
 
 
@@ -546,6 +578,9 @@ def download_model(model_name: str, prod: bool):
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Model file not found in MinIO: {e}")
 
+@app.get("/version")
+def get_version():
+    return {"version": SERVICE_VERSION}
 
 if __name__ == '__main__':
     keypath = "certs/privkey.pem"
